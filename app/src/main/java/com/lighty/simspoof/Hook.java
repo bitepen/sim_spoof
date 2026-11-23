@@ -41,6 +41,7 @@ public class Hook implements IXposedHookLoadPackage {
 
     private static final String TELEPHONY_PROPS = "android.sysprop.TelephonyProperties";
     private static final String SYSTEM_PROPS = "android.os.SystemProperties";
+    private static final String TELEPHONY_MGR = "android.telephony.TelephonyManager";
     private static final String SMS_CLASS = "com.android.internal.telephony.subscription.SubscriptionManagerService";
     private static final String CCL_CLASS = "com.android.phone.CarrierConfigLoader";
     private static final String CS_WRAPPER = "android.service.carrier.CarrierService$ICarrierServiceWrapper";
@@ -69,7 +70,7 @@ public class Hook implements IXposedHookLoadPackage {
     }
 
     private static void hookPhoneProcess(ClassLoader cl) {
-        // 1. 写入 sysprop 时仅伪装 cn / 460*，并记录各卡槽原始真实值；phone 进程自读时动态还原
+        // 1. 写入 sysprop 时仅伪装 cn / 460*，并按卡槽记录原始真实值；phone 进程自读时动态还原
         hookAll(cl, TELEPHONY_PROPS, "icc_operator_iso_country", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam p) {
@@ -160,8 +161,8 @@ public class Hook implements IXposedHookLoadPackage {
             }
         });
 
-        // 2. 兜底拦截 com.android.phone 内部通过 SystemProperties.get 的直接读取（按内存真实列表还原，无硬编码）
-        hookAll(cl, SYSTEM_PROPS, "get", new XC_MethodHook() {
+        // 2. 同时拦截 SystemProperties#get 与 JNI 层 native_get（彻底绕开 ART boot image 内联）
+        XC_MethodHook phonePropReadHook = new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
                 if (p.args.length < 1 || !(p.args[0] instanceof String)) return;
@@ -178,9 +179,44 @@ public class Hook implements IXposedHookLoadPackage {
                     }
                 }
             }
+        };
+        hookAll(cl, SYSTEM_PROPS, "get", phonePropReadHook);
+        hookAll(cl, SYSTEM_PROPS, "native_get", phonePropReadHook);
+
+        // 3. 直接拦截 CarrierResolver 与 CarrierConfigLoader 调用的 TelephonyManager 读取接口
+        hookAll(cl, TELEPHONY_MGR, "getSimOperatorNumericForPhone", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                if (p.args.length < 1 || !(p.args[0] instanceof Integer)) return;
+                int phoneId = (Integer) p.args[0];
+                List<String> orig = realNumericList;
+                if (orig != null && phoneId >= 0 && phoneId < orig.size()) {
+                    String real = orig.get(phoneId);
+                    String target = (real == null) ? "" : real;
+                    if (!target.equals(p.getResult())) {
+                        p.setResult(target);
+                    }
+                }
+            }
         });
 
-        // 3. 核查并按真实卡槽动态修正 CarrierConfigLoader 构造出的 CarrierIdentifier
+        hookAll(cl, TELEPHONY_MGR, "getSimCountryIsoForPhone", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                if (p.args.length < 1 || !(p.args[0] instanceof Integer)) return;
+                int phoneId = (Integer) p.args[0];
+                List<String> orig = realIsoList;
+                if (orig != null && phoneId >= 0 && phoneId < orig.size()) {
+                    String real = orig.get(phoneId);
+                    String target = (real == null) ? "" : real;
+                    if (!target.equals(p.getResult())) {
+                        p.setResult(target);
+                    }
+                }
+            }
+        });
+
+        // 4. 核查 CarrierConfigLoader 构造出的 CarrierIdentifier（正常情况下应直接拿到真实的 mcc/mnc 与 cid=1436）
         hookAll(cl, CCL_CLASS, "getCarrierIdentifierForPhoneId", new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
@@ -213,7 +249,7 @@ public class Hook implements IXposedHookLoadPackage {
             }
         });
 
-        // 4. 仅对目标 Google 包伪装中国大陆卡的 SubscriptionInfo 副本，境外卡原样放行
+        // 5. 仅对目标 Google 包伪装中国大陆卡的 SubscriptionInfo 副本，境外卡原样放行
         XC_MethodHook subHook = new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
@@ -271,7 +307,6 @@ public class Hook implements IXposedHookLoadPackage {
                 List<String> fixed = restoreListByRealSlots((List<?>) p.getResult(), true);
                 if (fixed != null) {
                     p.setResult(fixed);
-                    log(pkg + " restored icc_operator_numeric -> " + fixed);
                 }
             }
         });
@@ -287,7 +322,7 @@ public class Hook implements IXposedHookLoadPackage {
             }
         });
 
-        hookAll(cl, SYSTEM_PROPS, "get", new XC_MethodHook() {
+        XC_MethodHook carrierPropReadHook = new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
                 if (p.args.length < 1 || !(p.args[0] instanceof String)) return;
@@ -303,7 +338,9 @@ public class Hook implements IXposedHookLoadPackage {
                     p.setResult(fixed);
                 }
             }
-        });
+        };
+        hookAll(cl, SYSTEM_PROPS, "get", carrierPropReadHook);
+        hookAll(cl, SYSTEM_PROPS, "native_get", carrierPropReadHook);
 
         hookAll(cl, CS_WRAPPER, "getCarrierConfig", new XC_MethodHook() {
             @Override
@@ -327,7 +364,6 @@ public class Hook implements IXposedHookLoadPackage {
         });
     }
 
-    // 动态向 SubscriptionManager 查询真实的 CN 卡槽信息（不会触发硬编码，也不误伤真实台湾/境外卡）
     private static List<SubscriptionInfo> getRealCnSubInfos() {
         if (Boolean.TRUE.equals(IN_LOOKUP.get())) return Collections.emptyList();
         IN_LOOKUP.set(Boolean.TRUE);
