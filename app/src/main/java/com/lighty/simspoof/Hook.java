@@ -4,19 +4,18 @@ import android.content.Context;
 import android.os.Binder;
 import android.os.Parcel;
 import android.os.Process;
-import android.service.carrier.CarrierIdentifier;
 import android.telephony.SubscriptionInfo;
-import android.telephony.SubscriptionManager;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -27,7 +26,6 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 public class Hook implements IXposedHookLoadPackage {
     private static final String TAG = "SimSpoof: ";
 
-    // 仅针对中国大陆 SIM (cn / 460*) 伪装为台湾 (tw / 46692)，境外卡完全放行不碰
     private static final String CN_ISO = "cn";
     private static final String CN_MCC = "460";
 
@@ -36,17 +34,10 @@ public class Hook implements IXposedHookLoadPackage {
     private static final String SPOOF_MNC = "92";
     private static final String SPOOF_NUMERIC = SPOOF_MCC + SPOOF_MNC;
 
-    private static final String PROP_ISO = "gsm.sim.operator.iso-country";
-    private static final String PROP_NUMERIC = "gsm.sim.operator.numeric";
-
     private static final String TELEPHONY_PROPS = "android.sysprop.TelephonyProperties";
-    private static final String SYSTEM_PROPS = "android.os.SystemProperties";
     private static final String TELEPHONY_MGR = "android.telephony.TelephonyManager";
     private static final String SMS_CLASS = "com.android.internal.telephony.subscription.SubscriptionManagerService";
-    private static final String CCL_CLASS = "com.android.phone.CarrierConfigLoader";
-    private static final String CS_WRAPPER = "android.service.carrier.CarrierService$ICarrierServiceWrapper";
 
-    // 仅对这些 Google 用户态包伪装 SubscriptionInfo
     private static final Set<String> TARGET_PACKAGES = new HashSet<>(Arrays.asList(
             "com.google.android.gms",
             "com.google.android.gsf",
@@ -55,208 +46,35 @@ public class Hook implements IXposedHookLoadPackage {
             "com.google.android.apps.walletnfcrel"
     ));
 
-    private static volatile List<String> realIsoList = null;
-    private static volatile List<String> realNumericList = null;
-    private static final ThreadLocal<Boolean> IN_LOOKUP = new ThreadLocal<>();
+    private static volatile List<String> realIsoList;
+    private static volatile List<String> realNumericList;
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpp) {
-        String pkg = lpp.packageName;
-        if ("com.android.phone".equals(pkg)) {
-            hookPhoneProcess(lpp.classLoader);
-        } else {
-            hookCarrierRestore(lpp.classLoader, pkg);
-        }
-    }
+        if (!"com.android.phone".equals(lpp.packageName)) return;
+        ClassLoader cl = lpp.classLoader;
 
-    private static void hookPhoneProcess(ClassLoader cl) {
-        // 1. 写入 sysprop 时仅伪装 cn / 460*，并按卡槽记录原始真实值；phone 进程自读时动态还原
-        hookAll(cl, TELEPHONY_PROPS, "icc_operator_iso_country", new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                try {
-                    if (p.args.length != 1 || !(p.args[0] instanceof List)) return;
-                    List<?> raw = (List<?>) p.args[0];
-                    List<String> orig = new ArrayList<>(raw.size());
-                    List<String> spoofed = new ArrayList<>(raw.size());
-                    boolean changed = false;
+        // 1. 写入 sysprop 时仅将中国大陆 SIM (cn / 460*) 伪装为台湾，phone 进程自读时还原真实列表
+        hookAll(cl, TELEPHONY_PROPS, "icc_operator_iso_country", createPropHook(
+                CN_ISO::equalsIgnoreCase, SPOOF_ISO,
+                list -> realIsoList = list, () -> realIsoList
+        ));
+        hookAll(cl, TELEPHONY_PROPS, "icc_operator_numeric", createPropHook(
+                s -> s.startsWith(CN_MCC), SPOOF_NUMERIC,
+                list -> realNumericList = list, () -> realNumericList
+        ));
 
-                    for (Object o : raw) {
-                        String s = (o == null) ? null : o.toString();
-                        orig.add(s);
-                        if (CN_ISO.equalsIgnoreCase(s)) {
-                            spoofed.add(SPOOF_ISO);
-                            changed = true;
-                        } else {
-                            spoofed.add(s);
-                        }
-                    }
+        // 2. 绕开 boot-framework 内联，确保 CarrierResolver / CarrierConfigLoader 始终拿到各卡槽真实值
+        hookAll(cl, TELEPHONY_MGR, "getSimOperatorNumericForPhone", createPhoneGetterHook(() -> realNumericList));
+        hookAll(cl, TELEPHONY_MGR, "getSimCountryIsoForPhone", createPhoneGetterHook(() -> realIsoList));
 
-                    realIsoList = Collections.unmodifiableList(orig);
-                    if (changed) {
-                        p.args[0] = spoofed;
-                        log("write iso-country: " + orig + " -> " + spoofed);
-                    }
-                } catch (Throwable t) {
-                    log("iso-country write err: " + t);
-                }
-            }
-
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                try {
-                    if (p.args.length != 0) return;
-                    List<String> orig = realIsoList;
-                    if (orig != null) {
-                        p.setResult(new ArrayList<>(orig));
-                    }
-                } catch (Throwable t) {
-                    log("iso-country read err: " + t);
-                }
-            }
-        });
-
-        hookAll(cl, TELEPHONY_PROPS, "icc_operator_numeric", new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam p) {
-                try {
-                    if (p.args.length != 1 || !(p.args[0] instanceof List)) return;
-                    List<?> raw = (List<?>) p.args[0];
-                    List<String> orig = new ArrayList<>(raw.size());
-                    List<String> spoofed = new ArrayList<>(raw.size());
-                    boolean changed = false;
-
-                    for (Object o : raw) {
-                        String s = (o == null) ? null : o.toString();
-                        orig.add(s);
-                        if (s != null && s.startsWith(CN_MCC)) {
-                            spoofed.add(SPOOF_NUMERIC);
-                            changed = true;
-                        } else {
-                            spoofed.add(s);
-                        }
-                    }
-
-                    realNumericList = Collections.unmodifiableList(orig);
-                    if (changed) {
-                        p.args[0] = spoofed;
-                        log("write numeric: " + orig + " -> " + spoofed);
-                    }
-                } catch (Throwable t) {
-                    log("numeric write err: " + t);
-                }
-            }
-
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                try {
-                    if (p.args.length != 0) return;
-                    List<String> orig = realNumericList;
-                    if (orig != null) {
-                        p.setResult(new ArrayList<>(orig));
-                    }
-                } catch (Throwable t) {
-                    log("numeric read err: " + t);
-                }
-            }
-        });
-
-        // 2. 同时拦截 SystemProperties#get 与 JNI 层 native_get（彻底绕开 ART boot image 内联）
-        XC_MethodHook phonePropReadHook = new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (p.args.length < 1 || !(p.args[0] instanceof String)) return;
-                String key = (String) p.args[0];
-                if (PROP_NUMERIC.equals(key)) {
-                    List<String> orig = realNumericList;
-                    if (orig != null && !orig.isEmpty()) {
-                        p.setResult(joinList(orig));
-                    }
-                } else if (PROP_ISO.equals(key)) {
-                    List<String> orig = realIsoList;
-                    if (orig != null && !orig.isEmpty()) {
-                        p.setResult(joinList(orig));
-                    }
-                }
-            }
-        };
-        hookAll(cl, SYSTEM_PROPS, "get", phonePropReadHook);
-        hookAll(cl, SYSTEM_PROPS, "native_get", phonePropReadHook);
-
-        // 3. 直接拦截 CarrierResolver 与 CarrierConfigLoader 调用的 TelephonyManager 读取接口
-        hookAll(cl, TELEPHONY_MGR, "getSimOperatorNumericForPhone", new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (p.args.length < 1 || !(p.args[0] instanceof Integer)) return;
-                int phoneId = (Integer) p.args[0];
-                List<String> orig = realNumericList;
-                if (orig != null && phoneId >= 0 && phoneId < orig.size()) {
-                    String real = orig.get(phoneId);
-                    String target = (real == null) ? "" : real;
-                    if (!target.equals(p.getResult())) {
-                        p.setResult(target);
-                    }
-                }
-            }
-        });
-
-        hookAll(cl, TELEPHONY_MGR, "getSimCountryIsoForPhone", new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (p.args.length < 1 || !(p.args[0] instanceof Integer)) return;
-                int phoneId = (Integer) p.args[0];
-                List<String> orig = realIsoList;
-                if (orig != null && phoneId >= 0 && phoneId < orig.size()) {
-                    String real = orig.get(phoneId);
-                    String target = (real == null) ? "" : real;
-                    if (!target.equals(p.getResult())) {
-                        p.setResult(target);
-                    }
-                }
-            }
-        });
-
-        // 4. 核查 CarrierConfigLoader 构造出的 CarrierIdentifier（正常情况下应直接拿到真实的 mcc/mnc 与 cid=1436）
-        hookAll(cl, CCL_CLASS, "getCarrierIdentifierForPhoneId", new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                try {
-                    Object res = p.getResult();
-                    if (!(res instanceof CarrierIdentifier)) return;
-                    CarrierIdentifier id = (CarrierIdentifier) res;
-                    int phoneId = (p.args.length >= 1 && p.args[0] instanceof Integer) ? (Integer) p.args[0] : -1;
-
-                    List<String> orig = realNumericList;
-                    if (phoneId >= 0 && orig != null && phoneId < orig.size()) {
-                        String realNum = orig.get(phoneId);
-                        if (realNum != null && realNum.startsWith(CN_MCC) && realNum.length() >= 5
-                                && SPOOF_MCC.equals(id.getMcc()) && SPOOF_MNC.equals(id.getMnc())) {
-                            setFieldSafe(id, "mMcc", realNum.substring(0, 3), parseIntSafe(realNum.substring(0, 3), 460));
-                            setFieldSafe(id, "mMnc", realNum.substring(3), parseIntSafe(realNum.substring(3), 0));
-                            log("phone fixed CarrierIdentifier[slot=" + phoneId + "] -> mcc="
-                                    + id.getMcc() + " mnc=" + id.getMnc()
-                                    + " cid=" + id.getCarrierId() + " scid=" + id.getSpecificCarrierId());
-                            return;
-                        }
-                    }
-
-                    log("phone CarrierIdentifier[slot=" + phoneId + "]: mcc="
-                            + id.getMcc() + " mnc=" + id.getMnc()
-                            + " cid=" + id.getCarrierId() + " scid=" + id.getSpecificCarrierId());
-                } catch (Throwable t) {
-                    log("CCL hook err: " + t);
-                }
-            }
-        });
-
-        // 5. 仅对目标 Google 包伪装中国大陆卡的 SubscriptionInfo 副本，境外卡原样放行
+        // 3. 仅对目标 Google 包返回克隆并伪装后的 SubscriptionInfo，境外卡与其他进程原样放行
         XC_MethodHook subHook = new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam p) {
                 try {
                     Object res = p.getResult();
-                    if (res == null) return;
-                    if (!isTargetCaller(p.thisObject, p.args)) return;
+                    if (res == null || !isTargetCaller(p.thisObject, p.args)) return;
 
                     if (res instanceof SubscriptionInfo) {
                         p.setResult(cloneAndSpoof((SubscriptionInfo) res));
@@ -274,9 +92,7 @@ public class Hook implements IXposedHookLoadPackage {
                                 out.add(item);
                             }
                         }
-                        if (modified) {
-                            p.setResult(out);
-                        }
+                        if (modified) p.setResult(out);
                     }
                 } catch (Throwable t) {
                     log("sub query err: " + t);
@@ -284,227 +100,82 @@ public class Hook implements IXposedHookLoadPackage {
             }
         };
 
-        String[] subMethods = new String[] {
+        for (String method : new String[] {
                 "getActiveSubscriptionInfo",
                 "getActiveSubscriptionInfoForSimSlotIndex",
                 "getActiveSubscriptionInfoList",
                 "getAllSubInfoList",
                 "getAvailableSubscriptionInfoList",
                 "getAccessibleSubscriptionInfoList"
-        };
-        for (String m : subMethods) {
-            hookAll(cl, SMS_CLASS, m, subHook);
+        }) {
+            hookAll(cl, SMS_CLASS, method, subHook);
         }
     }
 
-    private static void hookCarrierRestore(ClassLoader cl, String pkg) {
-        log("init dynamic restore hook in " + pkg);
-
-        hookAll(cl, TELEPHONY_PROPS, "icc_operator_numeric", new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (p.args.length != 0 || !(p.getResult() instanceof List)) return;
-                List<String> fixed = restoreListByRealSlots((List<?>) p.getResult(), true);
-                if (fixed != null) {
-                    p.setResult(fixed);
-                }
-            }
-        });
-
-        hookAll(cl, TELEPHONY_PROPS, "icc_operator_iso_country", new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (p.args.length != 0 || !(p.getResult() instanceof List)) return;
-                List<String> fixed = restoreListByRealSlots((List<?>) p.getResult(), false);
-                if (fixed != null) {
-                    p.setResult(fixed);
-                }
-            }
-        });
-
-        XC_MethodHook carrierPropReadHook = new XC_MethodHook() {
-            @Override
-            protected void afterHookedMethod(MethodHookParam p) {
-                if (p.args.length < 1 || !(p.args[0] instanceof String)) return;
-                String key = (String) p.args[0];
-                boolean isNumeric = PROP_NUMERIC.equals(key);
-                boolean isIso = !isNumeric && PROP_ISO.equals(key);
-                if (!isNumeric && !isIso) return;
-
-                Object res = p.getResult();
-                if (!(res instanceof String)) return;
-                String fixed = restorePropStringByRealSlots((String) res, isNumeric);
-                if (fixed != null) {
-                    p.setResult(fixed);
-                }
-            }
-        };
-        hookAll(cl, SYSTEM_PROPS, "get", carrierPropReadHook);
-        hookAll(cl, SYSTEM_PROPS, "native_get", carrierPropReadHook);
-
-        hookAll(cl, CS_WRAPPER, "getCarrierConfig", new XC_MethodHook() {
+    private static XC_MethodHook createPropHook(
+            Predicate<String> shouldSpoof,
+            String spoofValue,
+            Consumer<List<String>> saveReal,
+            Supplier<List<String>> getReal) {
+        return new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam p) {
-                if (p.args == null) return;
-                for (Object arg : p.args) {
-                    if (arg instanceof CarrierIdentifier) {
-                        CarrierIdentifier id = (CarrierIdentifier) arg;
-                        if (fixCarrierIdentifierDynamic(id)) {
-                            log(pkg + " fixed incoming CarrierIdentifier -> mcc="
-                                    + id.getMcc() + " mnc=" + id.getMnc()
-                                    + " cid=" + id.getCarrierId() + " scid=" + id.getSpecificCarrierId());
+                try {
+                    if (p.args.length != 1 || !(p.args[0] instanceof List)) return;
+                    List<?> raw = (List<?>) p.args[0];
+                    List<String> orig = new ArrayList<>(raw.size());
+                    List<String> spoofed = new ArrayList<>(raw.size());
+                    boolean changed = false;
+
+                    for (Object o : raw) {
+                        String s = (o == null) ? null : o.toString();
+                        orig.add(s);
+                        if (s != null && shouldSpoof.test(s)) {
+                            spoofed.add(spoofValue);
+                            changed = true;
                         } else {
-                            log(pkg + " incoming CarrierIdentifier: mcc="
-                                    + id.getMcc() + " mnc=" + id.getMnc()
-                                    + " cid=" + id.getCarrierId() + " scid=" + id.getSpecificCarrierId());
+                            spoofed.add(s);
                         }
                     }
+
+                    saveReal.accept(Collections.unmodifiableList(orig));
+                    if (changed) p.args[0] = spoofed;
+                } catch (Throwable t) {
+                    log("prop write err: " + t);
                 }
             }
-        });
-    }
 
-    private static List<SubscriptionInfo> getRealCnSubInfos() {
-        if (Boolean.TRUE.equals(IN_LOOKUP.get())) return Collections.emptyList();
-        IN_LOOKUP.set(Boolean.TRUE);
-        try {
-            Class<?> at = XposedHelpers.findClass("android.app.ActivityThread", null);
-            Object appObj = XposedHelpers.callStaticMethod(at, "currentApplication");
-            if (!(appObj instanceof Context)) return Collections.emptyList();
-
-            SubscriptionManager sm = ((Context) appObj).getSystemService(SubscriptionManager.class);
-            if (sm == null) return Collections.emptyList();
-
-            List<SubscriptionInfo> active = sm.getActiveSubscriptionInfoList();
-            if (active == null || active.isEmpty()) return Collections.emptyList();
-
-            List<SubscriptionInfo> cnSubs = new ArrayList<>();
-            for (SubscriptionInfo info : active) {
-                String mcc = info.getMccString();
-                String iso = info.getCountryIso();
-                if ((mcc != null && mcc.startsWith(CN_MCC)) || CN_ISO.equalsIgnoreCase(iso)) {
-                    cnSubs.add(info);
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                try {
+                    if (p.args.length != 0) return;
+                    List<String> orig = getReal.get();
+                    if (orig != null) p.setResult(new ArrayList<>(orig));
+                } catch (Throwable t) {
+                    log("prop read err: " + t);
                 }
             }
-            return cnSubs;
-        } catch (Throwable ignored) {
-            return Collections.emptyList();
-        } finally {
-            IN_LOOKUP.remove();
-        }
+        };
     }
 
-    private static Map<Integer, String> buildRealCnSlotMap(boolean numeric) {
-        List<SubscriptionInfo> cnSubs = getRealCnSubInfos();
-        if (cnSubs.isEmpty()) return Collections.emptyMap();
-
-        Map<Integer, String> map = new HashMap<>();
-        for (SubscriptionInfo info : cnSubs) {
-            int slot = info.getSimSlotIndex();
-            if (slot < 0) continue;
-            if (numeric) {
-                String mcc = info.getMccString();
-                String mnc = info.getMncString();
-                if (mcc != null && mnc != null && !mcc.isEmpty() && !mnc.isEmpty()) {
-                    map.put(slot, mcc + mnc);
+    private static XC_MethodHook createPhoneGetterHook(Supplier<List<String>> getReal) {
+        return new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam p) {
+                try {
+                    if (p.args.length < 1 || !(p.args[0] instanceof Integer)) return;
+                    int phoneId = (Integer) p.args[0];
+                    List<String> orig = getReal.get();
+                    if (orig != null && phoneId >= 0 && phoneId < orig.size()) {
+                        String real = orig.get(phoneId);
+                        String target = (real == null) ? "" : real;
+                        if (!target.equals(p.getResult())) p.setResult(target);
+                    }
+                } catch (Throwable t) {
+                    log("phone getter err: " + t);
                 }
-            } else {
-                String iso = info.getCountryIso();
-                map.put(slot, (iso != null && !iso.isEmpty()) ? iso : CN_ISO);
             }
-        }
-        return map;
-    }
-
-    private static List<String> restoreListByRealSlots(List<?> list, boolean numeric) {
-        Map<Integer, String> slotMap = buildRealCnSlotMap(numeric);
-        if (slotMap.isEmpty()) return null;
-
-        String spoofToken = numeric ? SPOOF_NUMERIC : SPOOF_ISO;
-        List<String> out = new ArrayList<>(list.size());
-        boolean changed = false;
-
-        for (int i = 0; i < list.size(); i++) {
-            Object o = list.get(i);
-            String s = (o == null) ? null : o.toString();
-            if (slotMap.containsKey(i) && spoofToken.equalsIgnoreCase(s)) {
-                out.add(slotMap.get(i));
-                changed = true;
-            } else {
-                out.add(s);
-            }
-        }
-        return changed ? out : null;
-    }
-
-    private static String restorePropStringByRealSlots(String val, boolean numeric) {
-        if (val == null || val.isEmpty()) return null;
-        String spoofToken = numeric ? SPOOF_NUMERIC : SPOOF_ISO;
-        if (!val.toLowerCase().contains(spoofToken)) return null;
-
-        Map<Integer, String> slotMap = buildRealCnSlotMap(numeric);
-        if (slotMap.isEmpty()) return null;
-
-        String[] parts = val.split(",", -1);
-        boolean changed = false;
-        for (int i = 0; i < parts.length; i++) {
-            if (slotMap.containsKey(i) && spoofToken.equalsIgnoreCase(parts[i].trim())) {
-                parts[i] = slotMap.get(i);
-                changed = true;
-            }
-        }
-        if (!changed) return null;
-
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < parts.length; i++) {
-            if (i > 0) sb.append(',');
-            sb.append(parts[i]);
-        }
-        return sb.toString();
-    }
-
-    private static boolean fixCarrierIdentifierDynamic(CarrierIdentifier id) {
-        if (!SPOOF_MCC.equals(id.getMcc()) || !SPOOF_MNC.equals(id.getMnc())) return false;
-        List<SubscriptionInfo> cnSubs = getRealCnSubInfos();
-        if (cnSubs.isEmpty()) return false;
-
-        SubscriptionInfo matched = null;
-        for (SubscriptionInfo info : cnSubs) {
-            if (info.getCarrierId() == id.getCarrierId()) {
-                matched = info;
-                break;
-            }
-        }
-        if (matched == null && cnSubs.size() == 1) {
-            matched = cnSubs.get(0);
-        }
-        if (matched == null) return false;
-
-        String realMcc = matched.getMccString();
-        String realMnc = matched.getMncString();
-        if (realMcc == null || realMnc == null || realMcc.isEmpty() || realMnc.isEmpty()) return false;
-
-        setFieldSafe(id, "mMcc", realMcc, parseIntSafe(realMcc, 460));
-        setFieldSafe(id, "mMnc", realMnc, parseIntSafe(realMnc, 0));
-        return true;
-    }
-
-    private static String joinList(List<String> list) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < list.size(); i++) {
-            if (i > 0) sb.append(',');
-            String s = list.get(i);
-            if (s != null) sb.append(s);
-        }
-        return sb.toString();
-    }
-
-    private static int parseIntSafe(String s, int fallback) {
-        try {
-            return Integer.parseInt(s);
-        } catch (Throwable ignored) {
-            return fallback;
-        }
+        };
     }
 
     private static boolean isTargetCaller(Object service, Object[] args) {
@@ -532,9 +203,7 @@ public class Hook implements IXposedHookLoadPackage {
 
         if (args != null) {
             for (Object arg : args) {
-                if (arg instanceof String && TARGET_PACKAGES.contains(arg)) {
-                    return true;
-                }
+                if (arg instanceof String && TARGET_PACKAGES.contains(arg)) return true;
             }
         }
         return false;
@@ -543,8 +212,9 @@ public class Hook implements IXposedHookLoadPackage {
     private static SubscriptionInfo cloneAndSpoof(SubscriptionInfo orig) {
         String iso = orig.getCountryIso();
         String mcc = orig.getMccString();
-        boolean isCn = CN_ISO.equalsIgnoreCase(iso) || (mcc != null && mcc.startsWith(CN_MCC));
-        if (!isCn) return orig;
+        if (!CN_ISO.equalsIgnoreCase(iso) && (mcc == null || !mcc.startsWith(CN_MCC))) {
+            return orig;
+        }
 
         Parcel parcel = Parcel.obtain();
         SubscriptionInfo copy;
@@ -580,8 +250,9 @@ public class Hook implements IXposedHookLoadPackage {
     private static void hookAll(ClassLoader cl, String cls, String method, XC_MethodHook h) {
         try {
             Class<?> c = XposedHelpers.findClass(cls, cl);
-            int n = XposedBridge.hookAllMethods(c, method, h).size();
-            log("hooked " + cls + "#" + method + " x" + n);
+            if (XposedBridge.hookAllMethods(c, method, h).isEmpty()) {
+                log("NO MATCH " + cls + "#" + method);
+            }
         } catch (Throwable t) {
             log("FAILED " + cls + "#" + method + ": " + t);
         }

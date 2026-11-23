@@ -2,6 +2,5 @@
 <resources>
     <string-array name="xposed_scope">
         <item>com.android.phone</item>
-        <item>com.google.android.carrier</item>
     </string-array>
 </resources>
